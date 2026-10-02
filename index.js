@@ -3,15 +3,33 @@ const cors = require('cors');
 const multer = require('multer');
 require('dotenv').config();
 
+const { pool, initDb } = require('./db');
+const { router: authRouter, requireAuth } = require('./auth');
+
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
 app.use(cors());
 app.use(express.json());
 
+// Роуты /register, /login, /me
+app.use(authRouter);
+
 app.get('/', (req, res) => {
   res.json({ status: 'GeoLocate API running' });
 });
+
+// Сохраняет результат анализа; ошибка базы не должна ломать ответ пользователю
+async function saveAnalysis(userId, imageName, result) {
+  try {
+    await pool.query(
+      'INSERT INTO analyses (user_id, image_name, result) VALUES ($1, $2, $3)',
+      [userId, imageName, JSON.stringify(result)]
+    );
+  } catch (e) {
+    console.error('saveAnalysis error:', e);
+  }
+}
 
 function extractExif(buffer) {
   try {
@@ -88,14 +106,15 @@ async function reverseGeocode(lat, lng) {
   }
 }
 
-app.post('/analyze', upload.single('image'), async (req, res) => {
+// requireAuth: анализ доступен только вошедшим пользователям
+app.post('/analyze', requireAuth, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image provided' });
 
     const exif = extractExif(req.file.buffer);
     if (exif && exif.lat && exif.lng) {
       const location = await reverseGeocode(exif.lat, exif.lng);
-      return res.json({
+      const gpsResult = {
         location: location || 'GPS location found',
         lat: parseFloat(exif.lat.toFixed(4)),
         lng: parseFloat(exif.lng.toFixed(4)),
@@ -107,7 +126,9 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
           `Longitude: ${exif.lng.toFixed(6)}`,
           'Location verified via OpenStreetMap'
         ]
-      });
+      };
+      await saveAnalysis(req.user.id, req.file.originalname, gpsResult);
+      return res.json(gpsResult);
     }
 
     const Anthropic = require('@anthropic-ai/sdk');
@@ -132,6 +153,7 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
     const text = response.content.map(c => c.text || '').join('');
     const result = JSON.parse(text.replace(/```json|```/g, '').trim());
     result.source = 'AI';
+    await saveAnalysis(req.user.id, req.file.originalname, result);
     res.json(result);
 
   } catch (error) {
@@ -141,4 +163,11 @@ app.post('/analyze', upload.single('image'), async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// Сначала создаём таблицы, потом запускаем сервер
+initDb()
+  .then(() => app.listen(PORT, () => console.log(`Server running on port ${PORT}`)))
+  .catch((err) => {
+    console.error('DB init failed:', err);
+    process.exit(1);
+  });
